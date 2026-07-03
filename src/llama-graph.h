@@ -79,6 +79,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_moe_stream;
 
 //
 // llm_graph_input
@@ -678,6 +679,8 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    llama_moe_stream * moe_stream;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -906,6 +909,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    llama_moe_stream * moe_stream;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

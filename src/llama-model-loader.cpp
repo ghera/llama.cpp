@@ -1310,13 +1310,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             throw std::runtime_error(format("expert streaming does not support split models (tensor %s)", ggml_get_name(cur)));
         }
 
+        int role;
+        switch (tn.tensor) {
+            case LLM_TENSOR_FFN_GATE_EXPS: role = 0; break;
+            case LLM_TENSOR_FFN_UP_EXPS:   role = 1; break;
+            case LLM_TENSOR_FFN_DOWN_EXPS: role = 2; break;
+            default:
+                throw std::runtime_error(format("expert streaming does not support tensor %s", ggml_get_name(cur)));
+        }
+
         const int64_t n_expert = cur->ne[2];
         const int64_t n_slots  = std::max<int64_t>(1, std::min<int64_t>(n_expert, (int64_t)(moe_stream_frac*n_expert)));
 
         ggml_tensor * pool = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], n_slots);
         ggml_format_name(pool, "%s.pool", ggml_get_name(cur));
 
-        moe_stream.tensors.push_back({pool, w.offs, ggml_nbytes(cur)/n_expert, n_expert, n_slots});
+        moe_stream.add(tn.bid, role, pool, w.offs, ggml_nbytes(cur)/n_expert, n_expert, n_slots);
 
         size_data -= ggml_nbytes(cur);
         n_created++;

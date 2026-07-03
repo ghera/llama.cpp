@@ -624,8 +624,9 @@ struct llama_model {
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
-    // expert pools and slice index when expert streaming is enabled
-    llama_moe_stream moe_stream;
+    // expert pools and slice index when expert streaming is enabled; mutable
+    // because residency is cache state updated while evaluating a const model
+    mutable llama_moe_stream moe_stream;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

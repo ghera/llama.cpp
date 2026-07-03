@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "llama-moe-stream.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1350,6 +1352,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    moe_stream       (params.moe_stream),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1950,6 +1953,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (moe_stream && moe_stream->enabled()) {
+        ggml_tensor * slots = moe_stream->remap(ctx0, selected_experts, il);
+        if (slots) {
+            // the routing weights above use the original expert ids; the
+            // mul_mat_id calls below index the bounded pools by slot
+            selected_experts = slots;
+            cb(selected_experts, "ffn_moe_slots", il);
+        }
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
