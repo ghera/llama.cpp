@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-moe-stream.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -622,6 +623,9 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // expert pools and slice index when expert streaming is enabled
+    llama_moe_stream moe_stream;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

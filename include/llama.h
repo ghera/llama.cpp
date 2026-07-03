@@ -304,6 +304,10 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // budget in MiB for routed-expert weight pools; experts beyond the budget
+        // are streamed from disk on demand (0 = disabled)
+        uint32_t moe_stream_mib;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 

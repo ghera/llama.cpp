@@ -526,11 +526,18 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        uint32_t moe_stream_mib)
+        : moe_stream_mib(moe_stream_mib), metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
+    }
+
+    if (moe_stream_mib > 0 && use_mmap) {
+        // streamed expert pools own their memory, they cannot be mmap views
+        LLAMA_LOG_INFO("%s: expert streaming enabled - disabling mmap\n", __func__);
+        use_mmap = false;
     }
 
     if (param_overrides_p != nullptr) {
@@ -817,6 +824,24 @@ llama_model_loader::llama_model_loader(
     if (!llama_mmap::SUPPORTED) {
         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
         use_mmap = false;
+    }
+
+    if (moe_stream_mib > 0) {
+        size_t size_exps = 0;
+        for (const auto & it : weights_map) {
+            if (it.first.find("_exps.weight") != std::string::npos) {
+                size_exps += ggml_nbytes(it.second.tensor);
+            }
+        }
+        if (size_exps > 0) {
+            moe_stream.path = fname;
+            moe_stream_frac = std::min(1.0, moe_stream_mib*1024.0*1024.0/size_exps);
+            LLAMA_LOG_INFO("%s: expert streaming: %u MiB pool budget for %.1f MiB of expert weights (%.1f%%)\n",
+                    __func__, moe_stream_mib, size_exps/1024.0/1024.0, 100.0*moe_stream_frac);
+        } else {
+            LLAMA_LOG_WARN("%s: expert streaming requested but the model has no expert tensors - ignoring\n", __func__);
+            this->moe_stream_mib = 0;
+        }
     }
 
     this->use_mmap = use_mmap;
@@ -1275,6 +1300,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     if (cur == NULL) {
         return NULL;
+    }
+
+    // when expert streaming is enabled, stand in a bounded expert pool for the
+    // full expert tensor; slices are streamed from the file at eval time
+    if (moe_stream_mib > 0 && cur->ne[2] > 1 && tn.str().find("_exps.weight") != std::string::npos) {
+        const auto & w = require_weight(ggml_get_name(cur));
+        if (w.idx != 0) {
+            throw std::runtime_error(format("expert streaming does not support split models (tensor %s)", ggml_get_name(cur)));
+        }
+
+        const int64_t n_expert = cur->ne[2];
+        const int64_t n_slots  = std::max<int64_t>(1, std::min<int64_t>(n_expert, (int64_t)(moe_stream_frac*n_expert)));
+
+        ggml_tensor * pool = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], n_slots);
+        ggml_format_name(pool, "%s.pool", ggml_get_name(cur));
+
+        moe_stream.tensors.push_back({pool, w.offs, ggml_nbytes(cur)/n_expert, n_expert, n_slots});
+
+        size_data -= ggml_nbytes(cur);
+        n_created++;
+
+        return pool;
     }
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
