@@ -54,46 +54,53 @@ static void llama_moe_stream_remap_op(ggml_tensor * dst, const ggml_tensor * a, 
 
     auto & layer = *(llama_moe_stream_layer *) userdata;
 
-    const int64_t n = ggml_nelements(a);
+    GGML_ASSERT(a->type == GGML_TYPE_I32);
 
-    const int32_t * ids = (const int32_t *) a->data;
-    int32_t       * out = (int32_t       *) dst->data;
+    // a can be a strided view (ggml_top_k over a full argsort): address rows
+    // through nb[1] instead of assuming contiguous data
+    const int64_t n_used   = a->ne[0];
+    const int64_t n_tokens = ggml_nrows(a);
 
     layer.clock++;
 
     // resolve (and fetch) each unique expert once; stamping slot_used with the
     // current clock also pins this batch's experts against eviction below
-    for (int64_t i = 0; i < n; i++) {
-        const int32_t expert = ids[i];
-        GGML_ASSERT(expert >= 0 && expert < layer.n_expert);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        const int32_t * ids = (const int32_t *) ((const char *) a->data + t*a->nb[1]);
+        int32_t       * out = (int32_t       *) ((char       *) dst->data + t*dst->nb[1]);
 
-        int32_t slot = layer.expert_slot[expert];
-        if (slot < 0) {
-            // evict the least recently used slot not touched by this batch
-            int32_t best = -1;
-            for (int32_t s = 0; s < layer.n_slots; s++) {
-                if (layer.slot_used[s] == layer.clock) {
-                    continue;
+        for (int64_t i = 0; i < n_used; i++) {
+            const int32_t expert = ids[i];
+            GGML_ASSERT(expert >= 0 && expert < layer.n_expert);
+
+            int32_t slot = layer.expert_slot[expert];
+            if (slot < 0) {
+                // evict the least recently used slot not touched by this batch
+                int32_t best = -1;
+                for (int32_t s = 0; s < layer.n_slots; s++) {
+                    if (layer.slot_used[s] == layer.clock) {
+                        continue;
+                    }
+                    if (best < 0 || layer.slot_used[s] < layer.slot_used[best]) {
+                        best = s;
+                    }
                 }
-                if (best < 0 || layer.slot_used[s] < layer.slot_used[best]) {
-                    best = s;
+                if (best < 0) {
+                    GGML_ABORT("llama_moe_stream: batch needs more than %d expert slots - increase --stream-moe or reduce ubatch size",
+                            (int) layer.n_slots);
                 }
+                if (layer.slot_expert[best] >= 0) {
+                    layer.expert_slot[layer.slot_expert[best]] = -1;
+                }
+                llama_moe_stream_load_expert(layer, best, expert);
+                layer.slot_expert[best]   = expert;
+                layer.expert_slot[expert] = best;
+                slot = best;
             }
-            if (best < 0) {
-                GGML_ABORT("llama_moe_stream: batch needs more than %d expert slots - increase --stream-moe or reduce ubatch size",
-                        (int) layer.n_slots);
-            }
-            if (layer.slot_expert[best] >= 0) {
-                layer.expert_slot[layer.slot_expert[best]] = -1;
-            }
-            llama_moe_stream_load_expert(layer, best, expert);
-            layer.slot_expert[best]   = expert;
-            layer.expert_slot[expert] = best;
-            slot = best;
+            layer.slot_used[slot] = layer.clock;
+
+            out[i] = slot;
         }
-        layer.slot_used[slot] = layer.clock;
-
-        out[i] = slot;
     }
 }
 
