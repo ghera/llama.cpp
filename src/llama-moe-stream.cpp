@@ -39,10 +39,17 @@ static void llama_moe_stream_load_expert(llama_moe_stream_layer & layer, int32_t
         if (!pool) {
             continue;
         }
-        GGML_ASSERT(ggml_backend_buffer_is_host(pool->buffer));
-
         ms->file->seek(layer.offs[r] + (size_t) expert*layer.slice[r], SEEK_SET);
-        ms->file->read_raw((char *) pool->data + (size_t) slot*layer.slice[r], layer.slice[r]);
+
+        if (ggml_backend_buffer_is_host(pool->buffer)) {
+            ms->file->read_raw((char *) pool->data + (size_t) slot*layer.slice[r], layer.slice[r]);
+        } else {
+            // non-host pool (e.g. Metal unified memory): bounce through host and
+            // let the backend place the bytes
+            ms->scratch.resize(layer.slice[r]);
+            ms->file->read_raw(ms->scratch.data(), layer.slice[r]);
+            ggml_backend_tensor_set(pool, ms->scratch.data(), (size_t) slot*layer.slice[r], layer.slice[r]);
+        }
     }
 }
 

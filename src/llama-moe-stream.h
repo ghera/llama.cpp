@@ -40,6 +40,8 @@ struct llama_moe_stream {
 
     std::unique_ptr<llama_file> file; // lazy-opened on first miss
 
+    std::vector<uint8_t> scratch; // bounce buffer for non-host pools
+
     llama_moe_stream() = default;
     llama_moe_stream(llama_moe_stream &&);
     llama_moe_stream & operator=(llama_moe_stream &&);
