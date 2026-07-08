@@ -2,10 +2,12 @@
 
 #include "ggml.h"
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct llama_file;
@@ -30,7 +32,22 @@ struct llama_moe_stream_layer {
     std::vector<uint64_t> slot_used;   // lru stamps
     uint64_t clock = 0;
 
+    // per-expert routing frequency (this run + prior runs via the sidecar);
+    // pinned experts get a max lru stamp and are never evicted
+    std::vector<int64_t> freq;
+    std::vector<uint8_t> pinned;
+
     struct llama_moe_stream * stream = nullptr;
+};
+
+// work queue handing this node's missing slices to the idle ggml threads;
+// thread 0 resolves and publishes, every thread fetches
+struct llama_moe_stream_sync {
+    struct item { int32_t slot, expert, role; };
+    std::vector<item> pending; // one fetch per (slot, expert, matrix role)
+    std::atomic<uint64_t> seq{0};  // bumped once per node publication
+    std::atomic<int32_t>  next{0}; // next pending index to fetch
+    std::atomic<int32_t>  done{0}; // fetched count
 };
 
 struct llama_moe_stream {
@@ -42,12 +59,28 @@ struct llama_moe_stream {
 
     std::vector<uint8_t> scratch; // bounce buffer for non-host pools
 
+    std::unique_ptr<llama_moe_stream_sync> sync; // parallel fetch queue
+
+    // streaming stats, reported at teardown
+    int64_t n_lookup = 0; // expert activations seen by the remap op
+    int64_t n_miss   = 0; // slices fetched from disk
+    int64_t io_bytes = 0;
+    int64_t io_ns    = 0;
+
     llama_moe_stream() = default;
     llama_moe_stream(llama_moe_stream &&);
     llama_moe_stream & operator=(llama_moe_stream &&);
     ~llama_moe_stream();
 
+    bool stats_loaded = false;
+
     bool enabled() const { return !layers.empty(); }
+
+    std::string stats_path() const { return path + ".moestats"; }
+
+    // load prior routing frequencies from the sidecar and pin the hottest
+    // experts per layer; called once at first graph build
+    void load_stats();
 
     void add(int il, int role, ggml_tensor * pool, size_t offs, size_t slice, int64_t n_expert, int64_t n_slots);
 
