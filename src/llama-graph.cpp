@@ -1949,15 +1949,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    if (moe_stream && moe_stream->enabled()) {
-        ggml_tensor * slots = moe_stream->remap(ctx0, selected_experts, il);
-        if (slots) {
-            // the routing weights above use the original expert ids; the
-            // mul_mat_id calls below index the bounded pools by slot
-            selected_experts = slots;
-            cb(selected_experts, "ffn_moe_slots", il);
-        }
-    }
+    // the routed part of the FFN as a function of the (possibly remapped)
+    // expert ids and (possibly masked) routing weights, so that expert
+    // streaming can evaluate it once per pool wave and sum the results
+    auto build_routed = [&](ggml_tensor * cur, ggml_tensor * selected_experts, ggml_tensor * weights) -> ggml_tensor * {
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2144,6 +2139,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+    };
+
+    if (moe_stream && moe_stream->enabled() && moe_stream->streamed(il)) {
+        const int64_t n_slots = moe_stream->n_slots(il);
+
+        if (n_tokens*n_expert_used > n_slots) {
+            // prefill: the batch expert-union does not fit the pool; bulk-load
+            // the experts in pool-sized waves, evaluate the routed FFN per
+            // wave with out-of-wave routing weights masked to zero, and sum
+            ggml_tensor * moe_sum = nullptr;
+
+            for (int32_t w = 0; w < moe_stream->n_waves(il); w++) {
+                // out-of-wave ids point at the zero sentinel slot, so their
+                // routed contribution vanishes without masking the weights
+                ggml_tensor * ids_w = moe_stream->remap_wave(ctx0, selected_experts, il, w, moe_sum);
+                cb(ids_w, "ffn_moe_wave_slots", il);
+
+                ggml_tensor * out_w = build_routed(cur, ids_w, weights);
+                cb(out_w, "ffn_moe_wave_out", il);
+
+                moe_sum = moe_sum ? ggml_add(ctx0, moe_sum, out_w) : out_w;
+            }
+
+            cb(moe_sum, "ffn_moe_out", il);
+            return moe_sum;
+        }
+
+        ggml_tensor * slots = moe_stream->remap(ctx0, selected_experts, il);
+        if (slots) {
+            // the routing weights above use the original expert ids; the
+            // mul_mat_id calls below index the bounded pools by slot
+            selected_experts = slots;
+            cb(selected_experts, "ffn_moe_slots", il);
+        }
+    }
+
+    return build_routed(cur, selected_experts, weights);
 }
 
 // input embeddings with optional lora

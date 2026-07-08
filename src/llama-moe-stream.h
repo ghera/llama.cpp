@@ -38,6 +38,15 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t> pinned;
 
     struct llama_moe_stream * stream = nullptr;
+
+    // userdata for the per-wave prefill ops, sized n_waves on first use
+    struct wave_ud {
+        llama_moe_stream_layer * layer;
+        int32_t wave;
+    };
+    std::vector<wave_ud> waves;
+
+    bool zeroed = false; // reserved zero slots filled for the current graph
 };
 
 // work queue handing this node's missing slices to the idle ggml threads;
@@ -45,9 +54,10 @@ struct llama_moe_stream_layer {
 struct llama_moe_stream_sync {
     struct item { int32_t slot, expert, role; };
     std::vector<item> pending; // one fetch per (slot, expert, matrix role)
-    std::atomic<uint64_t> seq{0};  // bumped once per node publication
-    std::atomic<int32_t>  next{0}; // next pending index to fetch
-    std::atomic<int32_t>  done{0}; // fetched count
+    std::atomic<uint64_t> seq{0};     // bumped once per node publication
+    std::atomic<int32_t>  next{0};    // next pending index to fetch
+    std::atomic<int32_t>  done{0};    // fetched count
+    std::atomic<int32_t>  arrived{0}; // threads that entered the current node
 };
 
 struct llama_moe_stream {
@@ -76,6 +86,8 @@ struct llama_moe_stream {
 
     bool enabled() const { return !layers.empty(); }
 
+    bool streamed(int il) const { return layers.count(il) > 0; }
+
     std::string stats_path() const { return path + ".moestats"; }
 
     // load prior routing frequencies from the sidecar and pin the hottest
@@ -88,4 +100,21 @@ struct llama_moe_stream {
     // fetching missing slices from disk at eval time; nullptr when the layer
     // is not streamed
     ggml_tensor * remap(ggml_context * ctx, ggml_tensor * ids, int il);
+
+    // expert-major prefill: each wave bulk-loads a contiguous expert range
+    // into pool slots [0, wave_size) with a fixed mapping, once per graph; the
+    // routed sum over all waves equals the single-pass result. out-of-wave
+    // entries keep mul_mat_id's per-row distinct-ids invariant by pointing at
+    // one of n_expert_used reserved zero-filled slots, picked by row position,
+    // so their contribution vanishes as x*0 without touching the weights
+    int32_t n_slots(int il) const { return (int32_t) layers.at(il).n_slots; }
+    int32_t wave_size(int il) const { return (int32_t) (layers.at(il).n_slots - 8); }
+    int32_t n_waves(int il) const {
+        const auto & l = layers.at(il);
+        return (int32_t) ((l.n_expert + l.n_slots - 8 - 1)/(l.n_slots - 8));
+    }
+    // dep, when given, is consumed as a dataflow-only input: the wave's bulk
+    // load mutates pool tensors the scheduler cannot see, so each wave must
+    // depend on the previous wave's routed output to not clobber its slots
+    ggml_tensor * remap_wave(ggml_context * ctx, ggml_tensor * ids, int il, int32_t wave, ggml_tensor * dep);
 };
