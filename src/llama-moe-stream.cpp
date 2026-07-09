@@ -193,6 +193,29 @@ static void llama_moe_stream_remap_op(ggml_tensor * dst, const ggml_tensor * a, 
     auto & sync = *ms->sync;
     sync.pending.clear();
 
+    if (layer.clobbered) {
+        // wave prefill emptied the pool: preload the pinned hot set in one
+        // batch instead of paying it back as scattered decode misses
+        layer.clobbered = false;
+        int32_t slot = 0;
+        for (int32_t e = 0; e < layer.n_expert; e++) {
+            if (!layer.pinned[e]) {
+                continue;
+            }
+            layer.slot_expert[slot] = e;
+            layer.expert_slot[e]    = slot;
+            layer.slot_used[slot]   = UINT64_MAX;
+            for (int32_t r = 0; r < 3; r++) {
+                if (layer.pools[r]) {
+                    sync.pending.push_back({slot, e, r});
+                    ms->io_bytes += layer.slice[r];
+                }
+            }
+            ms->n_miss++;
+            slot++;
+        }
+    }
+
     layer.clock++;
 
     // resolve each unique expert once; stamping slot_used with the
@@ -301,10 +324,11 @@ static void llama_moe_stream_wave_op(ggml_tensor * dst, const ggml_tensor * a, c
     const int32_t e1 = std::min<int32_t>(e0 + ws, (int32_t) layer.n_expert);
 
     // the bulk load replaces the pool contents: the lru residency map is stale
-    // from here on, decode misses will rebuild it
+    // from here on, the first lru remap rebuilds it
     std::fill(layer.slot_expert.begin(), layer.slot_expert.end(), -1);
     std::fill(layer.expert_slot.begin(), layer.expert_slot.end(), -1);
     std::fill(layer.slot_used.begin(),   layer.slot_used.end(),    0);
+    layer.clobbered = true;
 
     if (ud.wave == 0) {
         layer.zeroed = false;

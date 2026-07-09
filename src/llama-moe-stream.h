@@ -46,7 +46,8 @@ struct llama_moe_stream_layer {
     };
     std::vector<wave_ud> waves;
 
-    bool zeroed = false; // reserved zero slots filled for the current graph
+    bool zeroed    = false; // reserved zero slots filled for the current graph
+    bool clobbered = false; // wave prefill replaced the lru pool contents
 };
 
 // work queue handing this node's missing slices to the idle ggml threads;
