@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-l2.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -895,6 +896,8 @@ private:
 
     llama_context * ctx_tgt = nullptr;
 
+    server_l2 l2;
+
     server_batch batch;
 
     llama_model   * model_dft = nullptr;
@@ -1152,6 +1155,10 @@ private:
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
+
+        if (params_base.n_parallel == 1) {
+            l2.init(); // durable L2 checkpoint cache (LLAMA_L2_DIR), single-slot only
+        }
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -1684,6 +1691,22 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // durable L2: when the incoming prompt shares little with the live
+        // cache but extends a stored checkpoint, restore it first so the
+        // usual prefix reuse only prefills the suffix
+        if (l2.enabled() && mctx == nullptr && task.tokens.size() > 0) {
+            const llama_tokens req  = task.tokens.get_text_tokens();
+            const size_t      have = slot.prompt.tokens.get_common_prefix(task.tokens);
+            const int ci = l2.lookup(req, have);
+            if (ci >= 0) {
+                llama_tokens restored;
+                if (l2.restore(ctx_tgt, ci, restored)) {
+                    slot.prompt.tokens.clear();
+                    slot.prompt.tokens.insert(restored);
+                }
+            }
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2070,6 +2093,7 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -3700,6 +3724,15 @@ private:
                 }
 
                 GGML_ASSERT(slot.task->need_sampling());
+
+                // durable L2: checkpoint at the prompt boundary - the state
+                // covers exactly the prompt tokens, which re-render identically
+                // in follow-up turns (generated tokens do not: retokenization
+                // at the assistant boundary breaks the strict-prefix match,
+                // and hybrid-recurrent state cannot be truncated)
+                if (l2.enabled() && mctx == nullptr) {
+                    l2.maybe_save(ctx_tgt, slot.prompt.tokens.get_text_tokens());
+                }
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
