@@ -23,6 +23,7 @@ struct llama_moe_stream_layer {
     size_t        offs [3] = { 0, 0, 0 }; // file offset of expert 0
     size_t        slice[3] = { 0, 0, 0 }; // bytes per expert slice
 
+    int     il       = -1; // block id, for successor lookup at prefetch time
     int64_t n_expert = 0;
     int64_t n_slots  = 0;
 
@@ -36,6 +37,10 @@ struct llama_moe_stream_layer {
     // pinned experts get a max lru stamp and are never evicted
     std::vector<int64_t> freq;
     std::vector<uint8_t> pinned;
+
+    // the previous batch's last-token routing, used to advise the kernel
+    // about the next token's likely reads a layer ahead
+    std::vector<int32_t> last_ids;
 
     struct llama_moe_stream * stream = nullptr;
 
@@ -71,6 +76,8 @@ struct llama_moe_stream {
     std::vector<uint8_t> scratch; // bounce buffer for non-host pools
 
     std::unique_ptr<llama_moe_stream_sync> sync; // parallel fetch queue
+
+    int advise_fd = -1; // dedicated fd for F_RDADVISE readahead hints
 
     // streaming stats, reported at teardown
     int64_t n_lookup = 0; // expert activations seen by the remap op

@@ -10,6 +10,9 @@
 #include <cinttypes>
 #include <thread>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+
 llama_moe_stream::llama_moe_stream(llama_moe_stream &&) = default;
 llama_moe_stream & llama_moe_stream::operator=(llama_moe_stream &&) = default;
 
@@ -37,12 +40,48 @@ llama_moe_stream::~llama_moe_stream() {
     fclose(f);
 }
 
+// hint the kernel to read a file range ahead of time (macOS async readahead);
+// a cheap advisory syscall: when the later pread arrives the bytes are already
+// in the page cache, so overlap costs no threads and no staging buffers
+static bool llama_moe_stream_advise_enabled(int which) {
+    // 1 = decode lookahead, 2 = prefill wave lookahead; both default off,
+    // measured harmful when the disk is already bandwidth-bound
+    const char * env = getenv(which == 1 ? "LLAMA_MOE_ADVISE_DECODE" : "LLAMA_MOE_ADVISE_PREFILL");
+    return env && atoi(env) != 0;
+}
+
+static void llama_moe_stream_advise(llama_moe_stream * ms, size_t off, size_t len) {
+#if defined(F_RDADVISE)
+    if (ms->advise_fd < 0) {
+        ms->advise_fd = open(ms->path.c_str(), O_RDONLY);
+        if (ms->advise_fd < 0) {
+            return;
+        }
+    }
+    struct radvisory ra;
+    ra.ra_offset = (off_t) off;
+    ra.ra_count  = (int) std::min<size_t>(len, INT_MAX);
+    (void) fcntl(ms->advise_fd, F_RDADVISE, &ra);
+#else
+    GGML_UNUSED(ms); GGML_UNUSED(off); GGML_UNUSED(len);
+#endif
+}
+
+static void llama_moe_stream_advise_expert(llama_moe_stream * ms, const llama_moe_stream_layer & layer, int32_t expert) {
+    for (int r = 0; r < 3; r++) {
+        if (layer.pools[r]) {
+            llama_moe_stream_advise(ms, layer.offs[r] + (size_t) expert*layer.slice[r], layer.slice[r]);
+        }
+    }
+}
+
 void llama_moe_stream::add(int il, int role, ggml_tensor * pool, size_t offs, size_t slice, int64_t n_expert, int64_t n_slots) {
     auto & layer = layers[il];
 
     GGML_ASSERT(role >= 0 && role < 3 && layer.pools[role] == nullptr);
     GGML_ASSERT(layer.n_expert == 0 || (layer.n_expert == n_expert && layer.n_slots == n_slots));
 
+    layer.il          = il;
     layer.pools[role] = pool;
     layer.offs [role] = offs;
     layer.slice[role] = slice;
@@ -105,6 +144,34 @@ void llama_moe_stream::load_stats() {
     if (n_pinned > 0) {
         fprintf(stderr, "moe-stream: pinned %" PRId64 " hot experts from %s\n", n_pinned, stats_path().c_str());
     }
+
+    // wire the pools so memory pressure cannot silently page them out and
+    // double the streaming IO; on failure keep whatever locked so far
+    // (LLAMA_MOE_MLOCK=0 disables)
+    const char * mlock_env = getenv("LLAMA_MOE_MLOCK");
+    if (mlock_env && atoi(mlock_env) == 0) {
+        return;
+    }
+    size_t locked = 0;
+    bool   failed = false;
+    for (auto & kv : layers) {
+        for (int r = 0; r < 3 && !failed; r++) {
+            ggml_tensor * pool = kv.second.pools[r];
+            if (!pool || !pool->data) {
+                continue;
+            }
+            if (mlock(pool->data, ggml_nbytes(pool)) != 0) {
+                failed = true;
+                break;
+            }
+            locked += ggml_nbytes(pool);
+        }
+        if (failed) {
+            break;
+        }
+    }
+    fprintf(stderr, "moe-stream: mlocked %.1f MiB of expert pools%s\n",
+            locked/1024.0/1024.0, failed ? " (partial, lock limit reached)" : "");
 }
 
 // drain the published miss list; runs concurrently on every ggml thread, each
@@ -266,6 +333,13 @@ static void llama_moe_stream_remap_op(ggml_tensor * dst, const ggml_tensor * a, 
         }
     }
 
+    // remember the last token's routing: it predicts the next token's ids
+    // for this layer well enough to drive kernel readahead
+    {
+        const int32_t * ids = (const int32_t *) ((const char *) a->data + (n_tokens - 1)*a->nb[1]);
+        layer.last_ids.assign(ids, ids + n_used);
+    }
+
     // publish the miss list to the waiting threads, join the fetch, then wait
     // for the pool slices to be in place before mul_mat_id consumes them
     const auto t_start = std::chrono::steady_clock::now();
@@ -273,6 +347,22 @@ static void llama_moe_stream_remap_op(ggml_tensor * dst, const ggml_tensor * a, 
     sync.next.store(0);
     sync.done.store(0);
     sync.seq.fetch_add(1, std::memory_order_release);
+
+    // while this layer's fetch runs, hint the kernel about the successor
+    // layer's likely misses (the previous token's routing there); at the last
+    // layer this warms layer 0 for the next token
+    if (llama_moe_stream_advise_enabled(1)) {
+        auto it = ms->layers.upper_bound(layer.il);
+        if (it == ms->layers.end()) {
+            it = ms->layers.begin();
+        }
+        const auto & next = it->second;
+        for (const int32_t e : next.last_ids) {
+            if (next.expert_slot[e] < 0) {
+                llama_moe_stream_advise_expert(ms, next, e);
+            }
+        }
+    }
 
     llama_moe_stream_fetch(layer);
 
@@ -365,6 +455,28 @@ static void llama_moe_stream_wave_op(ggml_tensor * dst, const ggml_tensor * a, c
     sync.next.store(0);
     sync.done.store(0);
     sync.seq.fetch_add(1, std::memory_order_release);
+
+    // hint the kernel about the next wave's byte ranges (or the successor
+    // layer's first wave) so its reads overlap with this wave's compute
+    if (llama_moe_stream_advise_enabled(2)) {
+        const llama_moe_stream_layer * nl = &layer;
+        int32_t nw = ud.wave + 1;
+        if (nw*ws >= (int32_t) layer.n_expert) {
+            auto it = ms->layers.upper_bound(layer.il);
+            if (it == ms->layers.end()) {
+                it = ms->layers.begin();
+            }
+            nl = &it->second;
+            nw = 0;
+        }
+        const int32_t ne0 = nw*ws;
+        const int32_t ne1 = std::min<int32_t>(ne0 + ws, (int32_t) nl->n_expert);
+        for (int r = 0; r < 3; r++) {
+            if (nl->pools[r]) {
+                llama_moe_stream_advise(ms, nl->offs[r] + (size_t) ne0*nl->slice[r], (size_t) (ne1 - ne0)*nl->slice[r]);
+            }
+        }
+    }
 
     llama_moe_stream_fetch(layer);
 
