@@ -93,9 +93,10 @@ struct llama_moe_stream {
 
     bool stats_loaded = false;
 
-    // slot eviction policy: lru stamps (+ pinned stick) or least-frequently-used
-    // resident expert (LLAMA_MOE_STREAM_POLICY=lfu); set by load_stats
-    bool lfu = false;
+    // slot eviction policy: least-frequently-used resident expert by default
+    // (wins or ties lru at every measured pool/depth, +21% at 5 GiB/12k);
+    // LLAMA_MOE_STREAM_POLICY=lru restores stamps + pinned stick
+    bool lfu = true;
 
     // routing trace sink (LLAMA_MOE_TRACE), qwell-moe-route-trace record
     // format: u32 layer | u32 phase (0 multi-token, 1 decode) | u32 n_ids | ids

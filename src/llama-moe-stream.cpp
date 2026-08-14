@@ -110,7 +110,7 @@ void llama_moe_stream::load_stats() {
     stats_loaded = true;
 
     const char * pol = getenv("LLAMA_MOE_STREAM_POLICY");
-    lfu = pol && strcmp(pol, "lfu") == 0;
+    lfu = !pol || strcmp(pol, "lru") != 0;
     fprintf(stderr, "moe-stream: eviction policy = %s\n", lfu ? "lfu" : "lru+pins");
 
     const char * tp = getenv("LLAMA_MOE_TRACE");
