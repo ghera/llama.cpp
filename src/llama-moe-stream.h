@@ -92,6 +92,10 @@ struct llama_moe_stream {
 
     bool stats_loaded = false;
 
+    // slot eviction policy: lru stamps (+ pinned stick) or least-frequently-used
+    // resident expert (LLAMA_MOE_STREAM_POLICY=lfu); set by load_stats
+    bool lfu = false;
+
     bool enabled() const { return !layers.empty(); }
 
     bool streamed(int il) const { return layers.count(il) > 0; }

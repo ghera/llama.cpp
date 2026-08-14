@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cstring>
 #include <thread>
 
 #include <fcntl.h>
@@ -21,8 +22,8 @@ llama_moe_stream::~llama_moe_stream() {
         return;
     }
 
-    fprintf(stderr, "moe-stream: teardown: lookups = %" PRId64 ", misses = %" PRId64 " (%.1f%%), read = %.1f MiB, io = %.1f ms (%.2f GiB/s)\n",
-            n_lookup, n_miss, 100.0*n_miss/n_lookup,
+    fprintf(stderr, "moe-stream: teardown: policy = %s, lookups = %" PRId64 ", misses = %" PRId64 " (%.1f%%), read = %.1f MiB, io = %.1f ms (%.2f GiB/s)\n",
+            lfu ? "lfu" : "lru+pins", n_lookup, n_miss, 100.0*n_miss/n_lookup,
             io_bytes/1024.0/1024.0, io_ns/1e6, io_bytes/(io_ns/1e9)/1024.0/1024.0/1024.0);
 
     // persist cumulative routing frequencies for the next run's pinning
@@ -103,6 +104,10 @@ void llama_moe_stream::add(int il, int role, ggml_tensor * pool, size_t offs, si
 
 void llama_moe_stream::load_stats() {
     stats_loaded = true;
+
+    const char * pol = getenv("LLAMA_MOE_STREAM_POLICY");
+    lfu = pol && strcmp(pol, "lfu") == 0;
+    fprintf(stderr, "moe-stream: eviction policy = %s\n", lfu ? "lfu" : "lru+pins");
 
     FILE * f = fopen(stats_path().c_str(), "r");
     if (!f) {
@@ -299,14 +304,21 @@ static void llama_moe_stream_remap_op(ggml_tensor * dst, const ggml_tensor * a, 
 
             int32_t slot = layer.expert_slot[expert];
             if (slot < 0) {
-                // evict the least recently used slot not touched by this batch
+                // evict a slot not touched by this batch: lru takes the oldest
+                // stamp, lfu the least-used resident expert (free slots first;
+                // freq already counts this batch, pins have no lfu protection)
                 int32_t best = -1;
+                uint64_t best_score = 0;
                 for (int32_t s = 0; s < layer.n_slots; s++) {
                     if (layer.slot_used[s] == layer.clock) {
                         continue;
                     }
-                    if (best < 0 || layer.slot_used[s] < layer.slot_used[best]) {
-                        best = s;
+                    const uint64_t score = ms->lfu
+                        ? (layer.slot_expert[s] < 0 ? 0 : (uint64_t) layer.freq[layer.slot_expert[s]] + 1)
+                        : layer.slot_used[s];
+                    if (best < 0 || score < best_score) {
+                        best       = s;
+                        best_score = score;
                     }
                 }
                 if (best < 0) {
