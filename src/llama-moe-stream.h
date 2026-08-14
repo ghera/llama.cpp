@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <string>
@@ -95,6 +96,10 @@ struct llama_moe_stream {
     // slot eviction policy: lru stamps (+ pinned stick) or least-frequently-used
     // resident expert (LLAMA_MOE_STREAM_POLICY=lfu); set by load_stats
     bool lfu = false;
+
+    // routing trace sink (LLAMA_MOE_TRACE), qwell-moe-route-trace record
+    // format: u32 layer | u32 phase (0 multi-token, 1 decode) | u32 n_ids | ids
+    FILE * trace_f = nullptr;
 
     bool enabled() const { return !layers.empty(); }
 
