@@ -15,8 +15,41 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 
+static void llama_moe_stream_fetch(llama_moe_stream_layer & layer);
+static void llama_moe_stream_io_main(llama_moe_stream * ms);
+
 llama_moe_stream::llama_moe_stream(llama_moe_stream &&) = default;
 llama_moe_stream & llama_moe_stream::operator=(llama_moe_stream &&) = default;
+
+llama_moe_stream_io::~llama_moe_stream_io() {
+    quit.store(true);
+    cv.notify_all();
+    for (auto & t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+}
+
+// drain one published miss list per seq bump, then sleep again; the queue is
+// the same sync struct the ggml-thread fetch path uses, one generation in
+// flight at a time (the graph serializes remap nodes through await_miss)
+static void llama_moe_stream_io_main(llama_moe_stream * ms) {
+    uint64_t seen = 0;
+    for (;;) {
+        llama_moe_stream_io * io = ms->io.get();
+        if (!io) {
+            return; // stream moved away; never fetched again
+        }
+        std::unique_lock<std::mutex> l(io->mtx);
+        io->cv.wait(l, [&] { return io->quit.load() || io->seq.load(std::memory_order_acquire) != seen; });
+        if (io->quit.load()) {
+            return;
+        }
+        seen = io->seq.load(std::memory_order_acquire);
+        llama_moe_stream_fetch(*io->layer);
+    }
+}
 
 llama_moe_stream::~llama_moe_stream() {
     if (trace_f) {
@@ -116,6 +149,12 @@ void llama_moe_stream::load_stats() {
     const char * tp = getenv("LLAMA_MOE_TRACE");
     if (tp && !trace_f) {
         trace_f = fopen(tp, "wb");
+    }
+
+    const char * ov = getenv("LLAMA_MOE_OVERLAP");
+    overlap = ov && atoi(ov) == 1;
+    if (overlap) {
+        fprintf(stderr, "moe-stream: overlap decode requested (not exact)\n");
     }
 
     FILE * f = fopen(stats_path().c_str(), "r");
@@ -307,6 +346,10 @@ static void llama_moe_stream_remap_op(ggml_tensor * dst, const ggml_tensor * a, 
     }
 
     layer.clock++;
+
+    // eviction roams all n_slots here, so the reserved zero slots the wave
+    // and overlap paths rely on must be considered dirty
+    layer.zeroed = false;
 
     // resolve each unique expert once; stamping slot_used with the
     // current clock also pins this batch's experts against eviction below
@@ -562,6 +605,182 @@ ggml_tensor * llama_moe_stream::remap_wave(ggml_context * ctx, ggml_tensor * ids
         dep = ids;
     }
     return ggml_map_custom2(ctx, ids, dep, llama_moe_stream_wave_op, GGML_N_TASKS_MAX, &layer.waves[wave]);
+}
+
+// overlap decode remap: resolve on thread 0, publish the miss list to the io
+// pool and return immediately; dst gets the resident-slot ids with misses
+// routed to the per-row-position reserved zero slots, await_miss later yields
+// the fetched half from layer.miss_buf. NOT summation-order exact: the routed
+// FFN is evaluated as two halves summed afterwards (opt-in via
+// LLAMA_MOE_OVERLAP)
+static void llama_moe_stream_overlap_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    if (ith != 0) {
+        return; // the io pool fetches; ggml threads move on to the hits branch
+    }
+    (void) nth;
+
+    auto & layer = *(llama_moe_stream_layer *) userdata;
+    llama_moe_stream * ms = layer.stream;
+
+    // lazy io-pool spawn: graph builds and the memory-fit pass run on
+    // throwaway models; spawning there would orphan threads on freed memory,
+    // so the io pool comes up only on the first eval of the real stream
+    if (!ms->io) {
+        ms->io.reset(new llama_moe_stream_io());
+        for (int i = 0; i < 4; i++) {
+            ms->io->threads.emplace_back([ms]() { llama_moe_stream_io_main(ms); });
+        }
+        fprintf(stderr, "moe-stream: overlap io pool up (%d threads) layer=%p il=%d\n",
+                (int) ms->io->threads.size(), (void *) &layer, layer.il);
+    }
+
+    GGML_ASSERT(a->type == GGML_TYPE_I32);
+
+    const int64_t n_used   = a->ne[0];
+    const int64_t n_tokens = ggml_nrows(a);
+
+    GGML_ASSERT(n_used <= 8); // one reserved zero slot per row position
+
+    const int32_t ws = (int32_t) layer.n_slots - 8; // slots n_slots-8.. hold zeros
+
+    if (!layer.zeroed) {
+        // fill the reserved slots with zeros; the lru path may have reused them
+        for (int32_t r = 0; r < 3; r++) {
+            if (layer.pools[r]) {
+                ms->scratch.assign(layer.slice[r], 0);
+                for (int32_t f = 0; f < 8; f++) {
+                    ggml_backend_tensor_set(layer.pools[r], ms->scratch.data(), (size_t) (ws + f)*layer.slice[r], layer.slice[r]);
+                }
+            }
+        }
+        layer.zeroed = true;
+    }
+
+    ms->n_lookup += n_used*n_tokens;
+
+    auto & sync = *ms->sync;
+    sync.pending.clear();
+
+    layer.clock++;
+    layer.miss_buf.assign(n_used*n_tokens, 0);
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        const int32_t * ids = (const int32_t *) ((const char *) a->data + t*a->nb[1]);
+        int32_t       * out = (int32_t       *) ((char       *) dst->data + t*dst->nb[1]);
+
+        for (int64_t i = 0; i < n_used; i++) {
+            const int32_t expert = ids[i];
+            GGML_ASSERT(expert >= 0 && expert < layer.n_expert);
+
+            layer.freq[expert]++;
+
+            bool miss = false;
+
+            int32_t slot = layer.expert_slot[expert];
+            if (slot < 0) {
+                miss = true;
+                // same victim selection as the lru/lfu remap, but the reserved
+                // zero slots are off-limits here
+                int32_t best = -1;
+                uint64_t best_score = 0;
+                for (int32_t s = 0; s < ws; s++) {
+                    if (layer.slot_used[s] == layer.clock) {
+                        continue;
+                    }
+                    const uint64_t score = ms->lfu
+                        ? (layer.slot_expert[s] < 0 ? 0 : (uint64_t) layer.freq[layer.slot_expert[s]] + 1)
+                        : layer.slot_used[s];
+                    if (best < 0 || score < best_score) {
+                        best       = s;
+                        best_score = score;
+                    }
+                }
+                if (best < 0) {
+                    GGML_ABORT("llama_moe_stream: batch needs more than %d expert slots - increase --stream-moe or reduce ubatch size",
+                            (int) ws);
+                }
+                if (layer.slot_expert[best] >= 0) {
+                    layer.expert_slot[layer.slot_expert[best]] = -1;
+                }
+                for (int32_t r = 0; r < 3; r++) {
+                    if (layer.pools[r]) {
+                        sync.pending.push_back({best, expert, r});
+                        ms->io_bytes += layer.slice[r];
+                    }
+                }
+                ms->n_miss++;
+                layer.slot_expert[best]   = expert;
+                layer.expert_slot[expert] = best;
+                slot = best;
+            }
+            layer.slot_used[slot] = layer.pinned[expert] ? UINT64_MAX : layer.clock;
+
+            // exactly one half holds the real slot; the other points at this
+            // row position's zero slot, so its x*0*w contribution vanishes
+            out[i]                       = miss ? ws + (int32_t) i : slot;
+            layer.miss_buf[t*n_used + i] = miss ? slot : ws + (int32_t) i;
+        }
+    }
+
+    // publish to the io pool; the hits branch runs while they read
+    sync.next.store(0);
+    sync.done.store(0);
+    ms->io->layer = &layer;
+    {
+        std::lock_guard<std::mutex> l(ms->io->mtx);
+        ms->io->seq.fetch_add(1, std::memory_order_release);
+    }
+    ms->io->cv.notify_all();
+}
+
+// join the io pool for this node, then expose the fetched half of the ids
+static void llama_moe_stream_await_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    if (ith != 0) {
+        return;
+    }
+    (void) a;
+    (void) nth;
+
+    auto & layer = *(llama_moe_stream_layer *) userdata;
+    llama_moe_stream * ms = layer.stream;
+
+    auto & sync = *ms->sync;
+    const auto t_start = std::chrono::steady_clock::now();
+    while (sync.done.load(std::memory_order_acquire) < (int32_t) sync.pending.size()) {
+        std::this_thread::yield();
+    }
+    ms->io_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_start).count();
+
+    const int64_t n_used   = dst->ne[0];
+    const int64_t n_tokens = ggml_nrows(dst);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = 0; i < n_used; i++) {
+            out[i] = layer.miss_buf[t*n_used + i];
+        }
+    }
+}
+
+ggml_tensor * llama_moe_stream::remap_overlap(ggml_context * ctx, ggml_tensor * ids, int il) {
+    auto it = layers.find(il);
+    if (it == layers.end()) {
+        return nullptr;
+    }
+    it->second.stream = this;
+
+    if (!stats_loaded) {
+        load_stats();
+    }
+
+    return ggml_map_custom1(ctx, ids, llama_moe_stream_overlap_op, GGML_N_TASKS_MAX, &it->second);
+}
+
+ggml_tensor * llama_moe_stream::await_miss(ggml_context * ctx, ggml_tensor * dep, int il) {
+    auto it = layers.find(il);
+    if (it == layers.end()) {
+        return nullptr;
+    }
+    return ggml_map_custom1(ctx, dep, llama_moe_stream_await_op, GGML_N_TASKS_MAX, &it->second);
 }
 
 ggml_tensor * llama_moe_stream::remap(ggml_context * ctx, ggml_tensor * ids, int il) {

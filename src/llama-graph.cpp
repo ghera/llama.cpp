@@ -2296,6 +2296,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             return moe_sum;
         }
 
+        if (moe_stream->overlap) {
+            // coarse overlap: resident experts compute while the io pool reads
+            // the misses; the two halves are summed, so this is not
+            // summation-order exact (opt-in, decode path only)
+            ggml_tensor * hits  = moe_stream->remap_overlap(ctx0, selected_experts, il);
+            ggml_tensor * out_h = build_routed(cur, hits, weights);
+            ggml_tensor * miss  = moe_stream->await_miss(ctx0, hits, il);
+            ggml_tensor * out_m = build_routed(cur, miss, weights);
+            ggml_tensor * moe_sum = ggml_add(ctx0, out_h, out_m);
+            cb(moe_sum, "ffn_moe_out", il);
+            return moe_sum;
+        }
+
         ggml_tensor * slots = moe_stream->remap(ctx0, selected_experts, il);
         if (slots) {
             // the routing weights above use the original expert ids; the
