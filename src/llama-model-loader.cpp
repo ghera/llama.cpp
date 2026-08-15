@@ -1330,6 +1330,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
     }
 
+    // when expert streaming is enabled, per-expert scales/biases are gathered
+    // by the mul_mat_id kernels with the same ids as the weights — after the
+    // id-remap those are slot ids, so the gather would silently corrupt the
+    // output. refuse models that carry them instead of streaming garbage.
+    if (moe_stream_mib > 0 && tn.suffix != nullptr &&
+            (strcmp(tn.suffix, "scale") == 0 || strcmp(tn.suffix, "bias") == 0) &&
+            (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+             tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS)) {
+        throw std::runtime_error(format("expert streaming does not support per-expert %s on tensor %s",
+                tn.suffix, ggml_get_name(cur)));
+    }
+
     // when expert streaming is enabled, stand in a bounded expert pool for the
     // full expert tensor; slices are streamed from the file at eval time
     if (moe_stream_mib > 0 && cur->ne[2] > 1 && tn.str().find("_exps.weight") != std::string::npos) {
@@ -1343,6 +1355,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             case LLM_TENSOR_FFN_GATE_EXPS: role = 0; break;
             case LLM_TENSOR_FFN_UP_EXPS:   role = 1; break;
             case LLM_TENSOR_FFN_DOWN_EXPS: role = 2; break;
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+                throw std::runtime_error(format("expert streaming does not support fused gate_up_exps tensor %s (convert without --fuse-gate-up-exps)", ggml_get_name(cur)));
             default:
                 throw std::runtime_error(format("expert streaming does not support tensor %s", ggml_get_name(cur)));
         }
