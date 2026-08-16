@@ -1338,12 +1338,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
     }
 
-    // when expert streaming is enabled, per-expert scales/biases are gathered
+    // when expert streaming is enabled, per-expert BIAS tensors are gathered
     // by the mul_mat_id kernels with the same ids as the weights — after the
     // id-remap those are slot ids, so the gather would silently corrupt the
-    // output. refuse models that carry them instead of streaming garbage.
-    if (moe_stream_mib > 0 && tn.suffix != nullptr &&
-            (strcmp(tn.suffix, "scale") == 0 || strcmp(tn.suffix, "bias") == 0) &&
+    // output. refuse models that carry them. per-expert SCALES are supported
+    // via the per-slot scale remap (see moe_stream.add / scale_slots).
+    if (moe_stream_mib > 0 && tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0 &&
             (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
              tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS)) {
         throw std::runtime_error(format("expert streaming does not support per-expert %s on tensor %s",
@@ -1360,11 +1360,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         int role;
         switch (tn.tensor) {
-            case LLM_TENSOR_FFN_GATE_EXPS: role = 0; break;
-            case LLM_TENSOR_FFN_UP_EXPS:   role = 1; break;
-            case LLM_TENSOR_FFN_DOWN_EXPS: role = 2; break;
-            case LLM_TENSOR_FFN_GATE_UP_EXPS:
-                throw std::runtime_error(format("expert streaming does not support fused gate_up_exps tensor %s (convert without --fuse-gate-up-exps)", ggml_get_name(cur)));
+            case LLM_TENSOR_FFN_GATE_EXPS:    role = 0; break; // separate gate
+            case LLM_TENSOR_FFN_UP_EXPS:      role = 1; break;
+            case LLM_TENSOR_FFN_DOWN_EXPS:    role = 2; break;
+            case LLM_TENSOR_FFN_GATE_UP_EXPS: role = 0; break; // fused gate+up: one pool, slice covers both
             default:
                 throw std::runtime_error(format("expert streaming does not support tensor %s", ggml_get_name(cur)));
         }
@@ -1375,7 +1374,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_tensor * pool = ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], n_slots);
         ggml_format_name(pool, "%s.pool", ggml_get_name(cur));
 
-        moe_stream.add(tn.bid, role, pool, w.offs, ggml_nbytes(cur)/n_expert, n_expert, n_slots);
+        // per-expert scale remap target: one [n_slots] f32 tensor per layer,
+        // on the pool backend, filled with scale[expert] by slot at eval time
+        ggml_tensor * scale_slots = nullptr;
+        if (!moe_stream.streamed(tn.bid)) {
+            scale_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_slots);
+            ggml_format_name(scale_slots, "%s.scale_slots", ggml_get_name(cur));
+        }
+
+        moe_stream.add(tn.bid, role, pool, w.offs, ggml_nbytes(cur)/n_expert, n_expert, n_slots, scale_slots);
 
         size_data -= ggml_nbytes(cur);
         n_created++;

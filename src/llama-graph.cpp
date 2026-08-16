@@ -2272,6 +2272,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     if (moe_stream && moe_stream->enabled() && moe_stream->streamed(il)) {
+        // per-expert scale remap: mul_mat_id gathers the scale with the same
+        // ids as the weights, which are slot ids after the remap below, so
+        // hand it a per-slot scale tensor filled by the remap/wave ops
+        if (moe_stream->has_scale(il)) {
+            moe_stream->set_scale_src(il, down_exps_s);
+            down_exps_s = moe_stream->scale_slots(il);
+        }
         const int64_t n_slots = moe_stream->n_slots(il);
 
         if (n_tokens*n_expert_used > n_slots) {

@@ -113,7 +113,7 @@ static void llama_moe_stream_advise_expert(llama_moe_stream * ms, const llama_mo
     }
 }
 
-void llama_moe_stream::add(int il, int role, ggml_tensor * pool, size_t offs, size_t slice, int64_t n_expert, int64_t n_slots) {
+void llama_moe_stream::add(int il, int role, ggml_tensor * pool, size_t offs, size_t slice, int64_t n_expert, int64_t n_slots, ggml_tensor * scale_slots) {
     auto & layer = layers[il];
 
     GGML_ASSERT(role >= 0 && role < 3 && layer.pools[role] == nullptr);
@@ -125,6 +125,7 @@ void llama_moe_stream::add(int il, int role, ggml_tensor * pool, size_t offs, si
     layer.slice[role] = slice;
     layer.n_expert    = n_expert;
     layer.n_slots     = n_slots;
+    layer.scale_slots = scale_slots;
 
     if (layer.slot_expert.empty()) {
         layer.slot_expert.assign(n_slots,  -1);
@@ -225,6 +226,30 @@ void llama_moe_stream::load_stats() {
     }
     fprintf(stderr, "moe-stream: mlocked %.1f MiB of expert pools%s\n",
             locked/1024.0/1024.0, failed ? " (partial, lock limit reached)" : "");
+}
+
+// fill layer.scale_slots[slot] = scale_host[expert_of_slot] (0 for free slots)
+// so mul_mat_id's internal per-expert scale gather by slot id reads the right
+// value; the model's {n_expert} scale tensor is fetched once, then only the
+// per-slot copy is rewritten each eval
+static void llama_moe_stream_scale_update(llama_moe_stream_layer & layer) {
+    if (!layer.scale_slots || !layer.scale_src) {
+        return;
+    }
+    llama_moe_stream * ms = layer.stream;
+    if (!layer.scale_loaded) {
+        layer.scale_host.assign(layer.n_expert, 0.0f);
+        ggml_backend_tensor_get(layer.scale_src, layer.scale_host.data(), 0, layer.n_expert*sizeof(float));
+        layer.scale_loaded = true;
+    }
+    layer.scale_scratch.assign(layer.n_slots, 0.0f);
+    for (int32_t s = 0; s < layer.n_slots; s++) {
+        const int32_t e = layer.slot_expert[s];
+        if (e >= 0) {
+            layer.scale_scratch[s] = layer.scale_host[e];
+        }
+    }
+    ggml_backend_tensor_set(layer.scale_slots, layer.scale_scratch.data(), 0, layer.n_slots*sizeof(float));
 }
 
 // drain the published miss list; runs concurrently on every ggml thread, each
@@ -413,6 +438,8 @@ static void llama_moe_stream_remap_op(ggml_tensor * dst, const ggml_tensor * a, 
         layer.last_ids.assign(ids, ids + n_used);
     }
 
+    llama_moe_stream_scale_update(layer);
+
     // publish the miss list to the waiting threads, join the fetch, then wait
     // for the pool slices to be in place before mul_mat_id consumes them
     const auto t_start = std::chrono::steady_clock::now();
@@ -492,6 +519,20 @@ static void llama_moe_stream_wave_op(ggml_tensor * dst, const ggml_tensor * a, c
     std::fill(layer.expert_slot.begin(), layer.expert_slot.end(), -1);
     std::fill(layer.slot_used.begin(),   layer.slot_used.end(),    0);
     layer.clobbered = true;
+
+    // wave mapping is fixed: slot i holds expert e0+i
+    if (layer.scale_slots && layer.scale_src) {
+        if (!layer.scale_loaded) {
+            layer.scale_host.assign(layer.n_expert, 0.0f);
+            ggml_backend_tensor_get(layer.scale_src, layer.scale_host.data(), 0, layer.n_expert*sizeof(float));
+            layer.scale_loaded = true;
+        }
+        layer.scale_scratch.assign(layer.n_slots, 0.0f);
+        for (int32_t i = 0; e0 + i < e1; i++) {
+            layer.scale_scratch[i] = layer.scale_host[e0 + i];
+        }
+        ggml_backend_tensor_set(layer.scale_slots, layer.scale_scratch.data(), 0, layer.n_slots*sizeof(float));
+    }
 
     if (ud.wave == 0) {
         layer.zeroed = false;

@@ -58,6 +58,16 @@ struct llama_moe_stream_layer {
     bool zeroed    = false; // reserved zero slots filled for the current graph
     bool clobbered = false; // wave prefill replaced the lru pool contents
 
+    // per-expert scale remap (gemma4-style ffn_down_exps.scale): scale_slots
+    // is a [n_slots] f32 tensor on the pool backend, filled at eval time with
+    // scale[expert] indexed by slot, so mul_mat_id's internal gather by slot
+    // id reads the right value; scale_src is the model's {n_expert} tensor
+    ggml_tensor * scale_slots  = nullptr;
+    const ggml_tensor * scale_src = nullptr;
+    std::vector<float> scale_host;
+    std::vector<float> scale_scratch;
+    bool scale_loaded = false;
+
     // miss->slot ids of the current remap_overlap node, copied out by
     // await_miss once the io pool signals completion
     std::vector<int32_t> miss_buf;
@@ -137,7 +147,13 @@ struct llama_moe_stream {
     // experts per layer; called once at first graph build
     void load_stats();
 
-    void add(int il, int role, ggml_tensor * pool, size_t offs, size_t slice, int64_t n_expert, int64_t n_slots);
+    void add(int il, int role, ggml_tensor * pool, size_t offs, size_t slice, int64_t n_expert, int64_t n_slots, ggml_tensor * scale_slots = nullptr);
+
+    // per-expert scale plumbing: the graph replaces the model's scale tensor
+    // argument with layer.scale_slots once set_scale_src recorded the source
+    bool has_scale(int il) const { return layers.count(il) > 0 && layers.at(il).scale_slots != nullptr; }
+    ggml_tensor * scale_slots(int il) { return layers.at(il).scale_slots; }
+    void set_scale_src(int il, const ggml_tensor * t) { if (t) layers.at(il).scale_src = t; }
 
     // build the op translating expert ids to pool slot ids for layer il,
     // fetching missing slices from disk at eval time; nullptr when the layer
