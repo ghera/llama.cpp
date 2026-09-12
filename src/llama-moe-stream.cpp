@@ -70,8 +70,9 @@ llama_moe_stream::~llama_moe_stream() {
     }
     for (const auto & kv : layers) {
         for (int32_t e = 0; e < kv.second.n_expert; e++) {
-            if (kv.second.freq[e] > 0) {
-                fprintf(f, "%d %d %lld\n", kv.first, e, (long long) kv.second.freq[e]);
+            const int64_t total = kv.second.prev[e] + kv.second.freq[e];
+            if (total > 0) {
+                fprintf(f, "%d %d %lld\n", kv.first, e, (long long) total);
             }
         }
     }
@@ -132,6 +133,8 @@ void llama_moe_stream::add(int il, int role, ggml_tensor * pool, size_t offs, si
         layer.expert_slot.assign(n_expert, -1);
         layer.slot_used.assign(n_slots, 0);
         layer.freq.assign(n_expert, 0);
+        layer.prev.assign(n_expert, 0);
+        layer.prior.assign(n_expert, 0);
         layer.pinned.assign(n_expert, 0);
     }
 
@@ -168,10 +171,43 @@ void llama_moe_stream::load_stats() {
     while (fscanf(f, "%d %d %lld", &il, &expert, &count) == 3) {
         auto it = layers.find(il);
         if (it != layers.end() && expert >= 0 && expert < it->second.n_expert) {
-            it->second.freq[expert] += count;
+            it->second.prev[expert] += count;
         }
     }
     fclose(f);
+
+    // ds4 b6af0ad: the sidecar ranks the preload, it is not a count of this
+    // run's routing. Feeding its raw magnitude into the eviction score keeps
+    // stale experts effectively pinned while demand-loaded ones starve, so
+    // the seed enters eviction only as a bounded rank head start and this
+    // run's observations overtake it after a few hundred lookups.
+    // Measured trade-off (bench/seed/curve.log): unbounded exploits a correct
+    // seed best (warm 7999-8086 misses vs 9250 fresh) but pays when the seed
+    // is stale (10122-10291); a small cap (8-32) instead lands near fresh in
+    // BOTH cases (8939-9021). No wall-clock difference at these settings, so
+    // this stays opt-in and the default behaviour is unchanged.
+    const char * cap_env = getenv("LLAMA_MOE_SEED_CAP");
+    const int64_t seed_cap = cap_env ? atoll(cap_env) : 0;
+    fprintf(stderr, "moe-stream: seed cap = %" PRId64 "%s\n", seed_cap,
+            seed_cap > 0 ? "" : " (unbounded, legacy)");
+
+    for (auto & kv : layers) {
+        auto & layer = kv.second;
+
+        std::vector<int32_t> order;
+        for (int32_t e = 0; e < layer.n_expert; e++) {
+            if (layer.prev[e] > 0) {
+                order.push_back(e);
+            }
+        }
+        std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return layer.prev[a] > layer.prev[b]; });
+
+        for (size_t i = 0; i < order.size(); i++) {
+            layer.prior[order[i]] = seed_cap > 0
+                ? std::max<int64_t>(0, seed_cap - (int64_t) i)
+                : layer.prev[order[i]];
+        }
+    }
 
     int64_t n_pinned = 0;
 
@@ -182,11 +218,11 @@ void llama_moe_stream::load_stats() {
         // an lru tail of 64 slots for a full 8-token ubatch expert-union
         std::vector<int32_t> order;
         for (int32_t e = 0; e < layer.n_expert; e++) {
-            if (layer.freq[e] > 0) {
+            if (layer.prev[e] > 0) {
                 order.push_back(e);
             }
         }
-        std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return layer.freq[a] > layer.freq[b]; });
+        std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return layer.prev[a] > layer.prev[b]; });
 
         const int64_t k = std::min<int64_t>(std::min<int64_t>(layer.n_slots*6/10, layer.n_slots - 64), (int64_t) order.size());
         for (int64_t i = 0; i < k; i++) {
@@ -400,7 +436,8 @@ static void llama_moe_stream_remap_op(ggml_tensor * dst, const ggml_tensor * a, 
                         continue;
                     }
                     const uint64_t score = ms->lfu
-                        ? (layer.slot_expert[s] < 0 ? 0 : (uint64_t) layer.freq[layer.slot_expert[s]] + 1)
+                        ? (layer.slot_expert[s] < 0 ? 0
+                            : (uint64_t) (layer.prior[layer.slot_expert[s]] + layer.freq[layer.slot_expert[s]]) + 1)
                         : layer.slot_used[s];
                     if (best < 0 || score < best_score) {
                         best       = s;
@@ -729,7 +766,8 @@ static void llama_moe_stream_overlap_op(ggml_tensor * dst, const ggml_tensor * a
                         continue;
                     }
                     const uint64_t score = ms->lfu
-                        ? (layer.slot_expert[s] < 0 ? 0 : (uint64_t) layer.freq[layer.slot_expert[s]] + 1)
+                        ? (layer.slot_expert[s] < 0 ? 0
+                            : (uint64_t) (layer.prior[layer.slot_expert[s]] + layer.freq[layer.slot_expert[s]]) + 1)
                         : layer.slot_used[s];
                     if (best < 0 || score < best_score) {
                         best       = s;

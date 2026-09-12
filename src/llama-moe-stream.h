@@ -37,9 +37,11 @@ struct llama_moe_stream_layer {
     std::vector<uint64_t> slot_used;   // lru stamps
     uint64_t clock = 0;
 
-    // per-expert routing frequency (this run + prior runs via the sidecar);
-    // pinned experts get a max lru stamp and are never evicted
+    // per-expert routing frequency observed in this run; the sidecar history
+    // is kept in prev and enters eviction only through the bounded prior
     std::vector<int64_t> freq;
+    std::vector<int64_t> prev;  // sidecar counts as read (cumulative history)
+    std::vector<int64_t> prior; // bounded rank-based head start from the sidecar
     std::vector<uint8_t> pinned;
 
     // the previous batch's last-token routing, used to advise the kernel
