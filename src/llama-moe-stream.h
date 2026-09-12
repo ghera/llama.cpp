@@ -42,6 +42,7 @@ struct llama_moe_stream_layer {
     std::vector<int64_t> freq;
     std::vector<int64_t> prev;  // sidecar counts as read (cumulative history)
     std::vector<int64_t> prior; // bounded rank-based head start from the sidecar
+                               // (LLAMA_MOE_SEED_CAP > 0; 0 = raw sidecar counts)
     std::vector<uint8_t> pinned;
 
     // the previous batch's last-token routing, used to advise the kernel

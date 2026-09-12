@@ -176,16 +176,27 @@ void llama_moe_stream::load_stats() {
     }
     fclose(f);
 
-    // ds4 b6af0ad: the sidecar ranks the preload, it is not a count of this
-    // run's routing. Feeding its raw magnitude into the eviction score keeps
-    // stale experts effectively pinned while demand-loaded ones starve, so
-    // the seed enters eviction only as a bounded rank head start and this
-    // run's observations overtake it after a few hundred lookups.
-    // Measured trade-off (bench/seed/curve.log): unbounded exploits a correct
-    // seed best (warm 7999-8086 misses vs 9250 fresh) but pays when the seed
-    // is stale (10122-10291); a small cap (8-32) instead lands near fresh in
-    // BOTH cases (8939-9021). No wall-clock difference at these settings, so
-    // this stays opt-in and the default behaviour is unchanged.
+    // The sidecar records which experts past sessions routed to. It is a
+    // ranking of the preload, not an observation of this run's routing, so
+    // feeding its raw magnitude into the eviction score keeps those experts
+    // effectively pinned and new hot ones can never displace them (same
+    // failure mode ds4 fixed in b6af0ad).
+    //
+    // LLAMA_MOE_SEED_CAP > 0 bounds the history's influence: the seeded
+    // experts get a rank-ordered head start of at most that many counts, and
+    // this run's observed counts (added per lookup) overtake it after a few
+    // hundred tokens. The sidecar itself is still rewritten with the true
+    // cumulative counts, and the post-wave preload is unchanged.
+    //
+    // Measured on Qwen3.6-35B-A3B Q4_K_XL, 4k decode, 8 GiB pool, miss count
+    // over 256 tokens (deterministic for a given sidecar; 1k expert lookups
+    // per token): no seed 9250; seed matching the workload 8086 unbounded vs
+    // 8781-9005 capped; seed from a different workload 10291 unbounded vs
+    // 8939-9021 capped. I.e. unbounded exploits a correct seed best and pays
+    // when it is stale, a cap of 8-32 lands near the no-seed baseline in both
+    // cases, and 256 is effectively unbounded at this scale. Wall-clock was
+    // unchanged in every arm, so the bounded mode is opt-in and the default
+    // (0) keeps the previous behaviour exactly.
     const char * cap_env = getenv("LLAMA_MOE_SEED_CAP");
     const int64_t seed_cap = cap_env ? atoll(cap_env) : 0;
     fprintf(stderr, "moe-stream: seed cap = %" PRId64 "%s\n", seed_cap,
