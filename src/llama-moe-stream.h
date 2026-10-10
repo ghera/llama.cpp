@@ -58,9 +58,6 @@ struct llama_moe_stream_layer {
     bool zeroed    = false; // reserved zero slots filled for the current graph
     bool clobbered = false; // wave prefill replaced the lru pool contents
 
-    // miss->slot ids of the current remap_overlap node, copied out by
-    // await_miss once the io pool signals completion
-    std::vector<int32_t> miss_buf;
 };
 
 // work queue handing this node's missing slices to the idle ggml threads;
@@ -72,18 +69,6 @@ struct llama_moe_stream_sync {
     std::atomic<int32_t>  next{0};    // next pending index to fetch
     std::atomic<int32_t>  done{0};    // fetched count
     std::atomic<int32_t>  arrived{0}; // threads that entered the current node
-};
-
-// persistent fetch threads for the overlap decode path: remap publishes the
-// miss list and returns, the hits branch runs while these drain it
-struct llama_moe_stream_io {
-    std::vector<std::thread>   threads;
-    std::mutex                 mtx;
-    std::condition_variable    cv;
-    std::atomic<uint64_t>      seq{0};
-    std::atomic<bool>          quit{false};
-    llama_moe_stream_layer   * layer = nullptr;
-    ~llama_moe_stream_io();
 };
 
 struct llama_moe_stream {
@@ -110,12 +95,6 @@ struct llama_moe_stream {
     llama_moe_stream & operator=(llama_moe_stream &&);
     ~llama_moe_stream();
 
-    // coarse overlap (LLAMA_MOE_OVERLAP=1): decode remap splits the routed
-    // FFN into resident and fetched halves so the resident mul_mat_id runs
-    // while the io pool reads the misses; NOT summation-order exact, opt-in
-    bool overlap = false;
-    std::unique_ptr<llama_moe_stream_io> io;
-
     bool stats_loaded = false;
 
     // slot eviction policy: least-frequently-used resident expert by default
@@ -139,13 +118,6 @@ struct llama_moe_stream {
     // fetching missing slices from disk at eval time; nullptr when the layer
     // is not streamed
     ggml_tensor * remap(ggml_context * ctx, ggml_tensor * ids, int il);
-
-    // overlap pair: remap_overlap resolves and publishes the miss list to the
-    // io pool, returning resident-slot ids immediately (misses point at the
-    // reserved zero slots); await_miss joins the pool and yields the fetched
-    // half. build the resident branch between the two so it overlaps the reads
-    ggml_tensor * remap_overlap(ggml_context * ctx, ggml_tensor * ids, int il);
-    ggml_tensor * await_miss(ggml_context * ctx, ggml_tensor * dep, int il);
 
     // expert-major prefill: each wave bulk-loads a contiguous expert range
     // into pool slots [0, wave_size) with a fixed mapping, once per graph; the
