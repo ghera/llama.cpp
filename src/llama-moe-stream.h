@@ -42,10 +42,6 @@ struct llama_moe_stream_layer {
     std::vector<int64_t> freq;
     std::vector<uint8_t> pinned;
 
-    // the previous batch's last-token routing, used to advise the kernel
-    // about the next token's likely reads a layer ahead
-    std::vector<int32_t> last_ids;
-
     struct llama_moe_stream * stream = nullptr;
 
     // userdata for the per-wave prefill ops, sized n_waves on first use
@@ -81,8 +77,6 @@ struct llama_moe_stream {
     std::vector<uint8_t> scratch; // bounce buffer for non-host pools
 
     std::unique_ptr<llama_moe_stream_sync> sync; // parallel fetch queue
-
-    int advise_fd = -1; // dedicated fd for F_RDADVISE readahead hints
 
     // streaming stats, reported at teardown
     int64_t n_lookup = 0; // expert activations seen by the remap op
