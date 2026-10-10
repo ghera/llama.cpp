@@ -52,9 +52,6 @@ static void llama_moe_stream_io_main(llama_moe_stream * ms) {
 }
 
 llama_moe_stream::~llama_moe_stream() {
-    if (trace_f) {
-        fclose(trace_f);
-    }
     if (n_lookup == 0) {
         return;
     }
@@ -145,11 +142,6 @@ void llama_moe_stream::load_stats() {
     const char * pol = getenv("LLAMA_MOE_STREAM_POLICY");
     lfu = !pol || strcmp(pol, "lru") != 0;
     fprintf(stderr, "moe-stream: eviction policy = %s\n", lfu ? "lfu" : "lru+pins");
-
-    const char * tp = getenv("LLAMA_MOE_TRACE");
-    if (tp && !trace_f) {
-        trace_f = fopen(tp, "wb");
-    }
 
     const char * ov = getenv("LLAMA_MOE_OVERLAP");
     overlap = ov && atoi(ov) == 1;
@@ -302,15 +294,6 @@ static void llama_moe_stream_remap_op(ggml_tensor * dst, const ggml_tensor * a, 
 
     // stats checkpoint roughly every 16k activations (~50 tokens on 40x8 routing)
     llama_moe_stream * ms = layer.stream;
-    if (ms->trace_f) {
-        // per-token records, token-major; phase 1 marks single-token (decode)
-        for (int64_t t = 0; t < n_tokens; t++) {
-            const int32_t * ids = (const int32_t *) ((const char *) a->data + t*a->nb[1]);
-            const uint32_t hdr[3] = { (uint32_t) layer.il, n_tokens > 1 ? 0u : 1u, (uint32_t) n_used };
-            fwrite(hdr, 4, 3, ms->trace_f);
-            fwrite(ids, 4, n_used, ms->trace_f);
-        }
-    }
     if (ms->n_lookup/16384 != (ms->n_lookup + n_used*n_tokens)/16384) {
         fprintf(stderr, "moe-stream: lookups = %" PRId64 ", misses = %" PRId64 " (%.1f%%), read = %.1f MiB, io = %.1f ms (%.2f GiB/s)\n",
                 ms->n_lookup, ms->n_miss, 100.0*ms->n_miss/ms->n_lookup,

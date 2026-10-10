@@ -123,10 +123,6 @@ struct llama_moe_stream {
     // LLAMA_MOE_STREAM_POLICY=lru restores stamps + pinned stick
     bool lfu = true;
 
-    // routing trace sink (LLAMA_MOE_TRACE), qwell-moe-route-trace record
-    // format: u32 layer | u32 phase (0 multi-token, 1 decode) | u32 n_ids | ids
-    FILE * trace_f = nullptr;
-
     bool enabled() const { return !layers.empty(); }
 
     bool streamed(int il) const { return layers.count(il) > 0; }
